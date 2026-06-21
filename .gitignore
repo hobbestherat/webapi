@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Go workspace files (this module is self-contained)
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
