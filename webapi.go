@@ -267,6 +267,23 @@ func validateHandler(endpoint Endpoint) error {
 	return nil
 }
 
+// computeBodySlot returns the index (>= 1) of the first handler parameter whose
+// Kind is Struct or Map — the parameter that will receive the JSON request body
+// on body-carrying methods (POST/PUT/PATCH). Returns -1 if there is no such
+// parameter. This is computed once at registration time and cached on the route
+// / captured in the wrapHandler closure, so the per-request hot path performs
+// no reflection scan to locate the body slot.
+func computeBodySlot(handler interface{}) int {
+	t := reflect.TypeOf(handler)
+	for i := 1; i < t.NumIn(); i++ {
+		k := t.In(i).Kind()
+		if k == reflect.Struct || k == reflect.Map {
+			return i
+		}
+	}
+	return -1
+}
+
 // route is an internal structure for compiled route patterns
 type route struct {
 	original    string           // Original path template
@@ -274,6 +291,13 @@ type route struct {
 	paramNames  []string         // Parameter names in order
 	endpoint    Endpoint         // The associated endpoint
 	handlerFunc http.HandlerFunc // The wrapped handler
+
+	// bodySlot is the index (>= 1) of the handler parameter that receives the
+	// JSON request body for body-carrying methods (POST/PUT/PATCH), scanned
+	// across all params for the first struct/map-typed one — not just In(1).
+	// -1 means no body receiver parameter exists. Cached at registration time
+	// so the per-request hot path does no reflection scan.
+	bodySlot int
 }
 
 // RegisterHandlers registers all endpoints with the provided HTTP mux
@@ -348,9 +372,10 @@ func (api *API) RegisterHandlers(mux *http.ServeMux) {
 			pathPatterns[endpoint.Path]["*CONFLICT*"] ||
 			len(pathPatterns[endpoint.Path]) > 1
 
-		// If path doesn't need the router, register it directly
+		// If path doesn't need the router, register it directly. The cached
+		// bodySlot is computed once per endpoint at registration time.
 		if !needsRouter {
-			mux.HandleFunc(exactPath, api.wrapHandler(endpoint))
+			mux.HandleFunc(exactPath, api.wrapHandler(endpoint, computeBodySlot(endpoint.Handler)))
 		} else {
 			needsCatchAll = true
 		}
@@ -412,8 +437,10 @@ func (api *API) compileRoute(endpoint Endpoint) route {
 	patternStr = "^" + patternStr + "$"
 	pattern := regexp.MustCompile(patternStr)
 
-	// Create a handler function
-	handlerFunc := api.wrapHandler(endpoint)
+	// Cache the body receiver parameter index at registration time and pass it
+	// to wrapHandler so the per-request closure does no reflection scan.
+	bodySlot := computeBodySlot(endpoint.Handler)
+	handlerFunc := api.wrapHandler(endpoint, bodySlot)
 
 	return route{
 		original:    endpoint.Path,
@@ -421,6 +448,7 @@ func (api *API) compileRoute(endpoint Endpoint) route {
 		paramNames:  paramNames,
 		endpoint:    endpoint,
 		handlerFunc: handlerFunc,
+		bodySlot:    bodySlot,
 	}
 }
 
@@ -538,8 +566,11 @@ func RequirePermission(ctx context.Context, checker PermissionChecker, perm stri
 	return user, nil
 }
 
-// wrapHandler creates a handler function that manages authentication and invokes the endpoint handler
-func (api *API) wrapHandler(endpoint Endpoint) http.HandlerFunc {
+// wrapHandler creates a handler function that manages authentication and invokes the endpoint handler.
+// bodySlot is the registration-time-cached index of the body receiver parameter
+// (>=1) or -1 if none; it is captured in the returned closure so the per-request
+// hot path performs no reflection scan to find the body slot.
+func (api *API) wrapHandler(endpoint Endpoint, bodySlot int) http.HandlerFunc {
 	// Endpoints that declare Permissions implicitly require auth.
 	authLevel := endpoint.AuthLevel
 	if len(endpoint.Permissions) > 0 && authLevel != AuthRequired {
@@ -643,10 +674,12 @@ func (api *API) wrapHandler(endpoint Endpoint) http.HandlerFunc {
 			r.Body = http.MaxBytesReader(w, r.Body, bodyCap)
 		}
 
-		// Step 5: Process the request
+		// Step 5: Process the request. bodySlot is the cached body receiver
+		// parameter index (or -1); handleRequest uses it instead of
+		// re-scanning the handler signature on every request.
 		handlerValue := reflect.ValueOf(endpoint.Handler)
 		handlerType := handlerValue.Type()
-		api.handleRequest(w, r, handlerValue, handlerType)
+		api.handleRequest(w, r, handlerValue, handlerType, bodySlot)
 	}
 }
 
@@ -706,20 +739,33 @@ func (api *API) prepareHandlerArgs(w http.ResponseWriter, r *http.Request, handl
 	return args, true
 }
 
-// processRequestBody processes the request body for data parameter
-func (api *API) processRequestBody(w http.ResponseWriter, r *http.Request, args []reflect.Value, handlerType reflect.Type) (interface{}, bool) {
-	if handlerType.NumIn() < 2 {
-		return nil, true
+// processRequestBody decodes the JSON request body into the handler's body
+// receiver parameter. bodySlot is the registration-time-cached index (>= 1) of
+// the first struct/map-typed parameter; -1 means there is no body receiver.
+//
+// It returns the slot index that was filled (so the caller can skip it when
+// binding path/query params) and true on success, or -1 and false after writing
+// an HTTP error. When no body receiver exists but the client sent a non-empty
+// body, it fails loud with 400 instead of silently dropping the body.
+func (api *API) processRequestBody(w http.ResponseWriter, r *http.Request, args []reflect.Value, handlerType reflect.Type, bodySlot int) (int, bool) {
+	if bodySlot < 0 {
+		// No body receiver parameter on this handler. Fail loud if the
+		// client actually sent a body rather than silently dropping it.
+		// ContentLength == 0 is an empty body (ok); > 0 is a known size;
+		// -1 is chunked/unknown, so we treat it as a present body and
+		// require it to actually contain bytes.
+		if r.ContentLength == 0 {
+			return -1, true
+		}
+		http.Error(w, "Request body not expected for this endpoint", http.StatusBadRequest)
+		return -1, false
 	}
 
-	paramType := handlerType.In(1)
-	if paramType.Kind() != reflect.Map && paramType.Kind() != reflect.Struct {
-		return nil, true
-	}
+	paramType := handlerType.In(bodySlot)
 
 	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
-		return nil, false
+		return -1, false
 	}
 
 	// Create a new instance of the parameter type
@@ -730,23 +776,23 @@ func (api *API) processRequestBody(w http.ResponseWriter, r *http.Request, args 
 	err := decoder.Decode(paramValue)
 	if err != nil {
 		if errors.Is(err, io.EOF) && paramType.Kind() == reflect.Struct && paramType.NumField() == 0 {
-			args[1] = reflect.ValueOf(paramValue).Elem()
-			return paramValue, true
+			args[bodySlot] = reflect.ValueOf(paramValue).Elem()
+			return bodySlot, true
 		} else if errors.Is(err, io.EOF) {
 			http.Error(w, "Request body is required", http.StatusBadRequest)
 		} else {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 		}
-		return nil, false
+		return -1, false
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		http.Error(w, "Invalid request body: multiple JSON values", http.StatusBadRequest)
-		return nil, false
+		return -1, false
 	}
 
 	// Store the parameter value
-	args[1] = reflect.ValueOf(paramValue).Elem()
-	return paramValue, true
+	args[bodySlot] = reflect.ValueOf(paramValue).Elem()
+	return bodySlot, true
 }
 
 func isJSONContentType(contentType string) bool {
@@ -757,14 +803,23 @@ func isJSONContentType(contentType string) bool {
 	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
 }
 
-// processPathAndQueryParams processes path and query parameters
+// processPathAndQueryParams processes path and query parameters across every
+// handler parameter (from index 1). skipSlot is the index of the parameter that
+// already received the request body (the body receiver can sit anywhere in the
+// signature, not just at position 1); it is skipped here so it is not also
+// bound from the path/query. -1 means no parameter was filled with the body.
 func (api *API) processPathAndQueryParams(w http.ResponseWriter, r *http.Request, args []reflect.Value, handlerType reflect.Type,
-	orderedParamNames []string, params map[string]string, startIdx int) bool {
+	orderedParamNames []string, params map[string]string, skipSlot int) bool {
 
 	numIn := handlerType.NumIn()
 	paramIndex := 0
 
-	for i := startIdx; i < numIn; i++ {
+	for i := 1; i < numIn; i++ {
+		// The body receiver parameter was already filled by processRequestBody;
+		// don't rebind it from the path/query.
+		if i == skipSlot {
+			continue
+		}
 		paramType := handlerType.In(i)
 
 		// Handle different parameter types
@@ -874,9 +929,11 @@ func (api *API) callHandlerAndProcessResults(w http.ResponseWriter, r *http.Requ
 }
 
 // handleRequest processes any HTTP request and invokes the handler function.
-// Methods that carry a request body (POST, PUT, PATCH) will attempt to decode
-// the body into the handler's second parameter if it is a struct or map.
-func (api *API) handleRequest(w http.ResponseWriter, r *http.Request, handlerValue reflect.Value, handlerType reflect.Type) {
+// bodySlot is the registration-time-cached index of the body receiver
+// parameter (>= 1) or -1 if none. For methods that carry a request body
+// (POST, PUT, PATCH) the body is decoded into that parameter (if any); the
+// returned slot index tells processPathAndQueryParams which param to skip.
+func (api *API) handleRequest(w http.ResponseWriter, r *http.Request, handlerValue reflect.Value, handlerType reflect.Type, bodySlot int) {
 	// Prepare arguments for the handler function
 	args, ok := api.prepareHandlerArgs(w, r, handlerType)
 	if !ok {
@@ -886,24 +943,35 @@ func (api *API) handleRequest(w http.ResponseWriter, r *http.Request, handlerVal
 	// Extract path parameters
 	params := GetPathParams(r.Context())
 
-	// For methods that carry a body, try to decode the request body
-	startIdx := 1
+	// For methods that carry a body, decode the request body into the receiver
+	// parameter (whose index is cached in bodySlot). filledSlot is the argument
+	// index that was filled (-1 if none); it becomes the param that
+	// processPathAndQueryParams must skip so it is not also bound from the
+	// path/query.
+	skipSlot := -1
 	hasBody := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch
 	if hasBody {
-		requestData, ok := api.processRequestBody(w, r, args, handlerType)
+		filledSlot, ok := api.processRequestBody(w, r, args, handlerType, bodySlot)
 		if !ok {
 			return
 		}
-		if requestData != nil {
-			startIdx = 2
-		}
+		skipSlot = filledSlot
+	} else if r.ContentLength != 0 {
+		// GET/DELETE and other non-body methods never decode a request body
+		// (a struct param on these methods binds query params, not the body),
+		// so any body the client sends would be silently ignored. Fail loud for
+		// the same reason processRequestBody rejects a body with no receiver.
+		// ContentLength != 0 covers both a known non-empty body (> 0) and a
+		// chunked/unknown body (-1); a truly empty body (0) is accepted.
+		http.Error(w, "Request body not expected for this method", http.StatusBadRequest)
+		return
 	}
 
 	// Get ordered parameter names
 	orderedParamNames := api.getOrderedParamNames(r, params)
 
 	// Process path and query parameters
-	if !api.processPathAndQueryParams(w, r, args, handlerType, orderedParamNames, params, startIdx) {
+	if !api.processPathAndQueryParams(w, r, args, handlerType, orderedParamNames, params, skipSlot) {
 		return
 	}
 

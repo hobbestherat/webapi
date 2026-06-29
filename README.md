@@ -130,9 +130,8 @@ func (s *Service) Name(r *http.Request [, body] [, pathParams...] [, queryStruct
 ```
 
 - **1st param:** always `*http.Request`.
-- **2nd param (body):** for `POST`/`PUT`/`PATCH`, may be a `struct` or
-  `map`. Decoded from the JSON request body. Omit it for handlers that take
-  no body.
+- **Body param:** for `POST`/`PUT`/`PATCH`, the request body is decoded into
+  the **first** `struct` or `map` parameter (scanning all params in order). Omit it for handlers that take no body.
 - **Remaining params:** bound from the route's **path parameters**
   (positional, in route order). Supported kinds:
   - `string` — one path param
@@ -151,6 +150,15 @@ The handler must return **exactly two values**: a result and an `error`.
 ```go
 // Path: /api/things/:id/edit/:field
 func (s *Service) Edit(r *http.Request, body EditReq, id string, field string) (interface{}, error)
+```
+
+The body receiver may appear anywhere in the signature — it does not have to be
+the second parameter; the first `struct`/`map` parameter is used:
+
+```go
+// Path: /api/groups/:id/members
+// In(1)=id (path), In(2)=member (body) — body is bound correctly.
+func (s *Service) AddMember(r *http.Request, id string, member MemberReq) (interface{}, error)
 ```
 
 ---
@@ -186,10 +194,21 @@ Routes are declared with `:name` path parameters:
 
 ## Request binding
 
-- **JSON bodies** (`POST`/`PUT`/`PATCH` whose 2nd handler param is a struct or
-  map) require a `Content-Type` of `application/json` (or any `…+json`
-  variant such as `application/vnd.foo+json`). Anything else yields
+- **JSON bodies** (`POST`/`PUT`/`PATCH` that declare a `struct` or `map`
+  body parameter) require a `Content-Type` of `application/json` (or any
+  `…+json` variant such as `application/vnd.foo+json`). Anything else yields
   `415 Unsupported Media Type`.
+- **Body receiver:** the body is decoded into the **first** `struct`/`map`
+  parameter (scanned across the whole signature).
+- **Body present but no receiver:** a `POST`/`PUT`/`PATCH` that carries a
+  non-empty body to a handler with no `struct`/`map` parameter is rejected
+  with `400` (fail loud) rather than silently dropping the body. A truly empty
+  body is accepted.
+- **Body on a non-body method:** `GET`/`DELETE` (and any method other than
+  `POST`/`PUT`/`PATCH`) never decode a request body — a `struct` param on these
+  methods binds query params, not the body. A non-empty body on such a request
+  is therefore rejected with `400` (fail loud) instead of being silently
+  ignored. A truly empty body is accepted.
 - **Empty body:** a struct-typed body is allowed to be empty only if the
   struct has zero fields; otherwise a body is required (`400`).
 - **Multiple JSON values** in one body are rejected (`400`).

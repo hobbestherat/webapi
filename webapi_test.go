@@ -157,6 +157,27 @@ func (s *TestService) PostWithMixedParams(r *http.Request, data map[string]strin
 	return result, nil
 }
 
+// PostPathThenBody has a string path param at In(1) and the JSON body map at
+// In(2). This exercises the body receiver being located beyond the second
+// parameter (the original bug: In(1) isn't a struct, so the body was silently
+// dropped).
+func (s *TestService) PostPathThenBody(r *http.Request, context string, data map[string]string) (interface{}, error) {
+	result := map[string]string{
+		"context": context,
+	}
+	for k, v := range data {
+		result[k] = v
+	}
+	return result, nil
+}
+
+// PostNoBodyReceiver takes only a string path parameter and no struct/map
+// parameter, so it has no body receiver. A request with a non-empty body must
+// be rejected with 400 (fail loud) instead of silently dropped.
+func (s *TestService) PostNoBodyReceiver(r *http.Request, context string) (interface{}, error) {
+	return map[string]string{"context": context}, nil
+}
+
 // DELETE handler with path parameter
 func (s *TestService) DeleteItem(r *http.Request, itemID string) (interface{}, error) {
 	return map[string]string{
@@ -995,4 +1016,176 @@ func TestAcceptsStructuredBodyWithJSONSuffixContentType(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for +json content type, got %d body=%q", w.Code, w.Body.String())
 	}
+}
+
+// TestPostBodySlotNotSecondParam verifies that the JSON request body is bound
+// to the first struct/map parameter even when it is not the second handler
+// parameter. Here In(1) is a string path param and In(2) is the body map.
+// Previously the body was silently dropped because only In(1) was inspected.
+func TestPostBodySlotNotSecondParam(t *testing.T) {
+	service := &TestService{}
+	api := &API{
+		BasePath:        "/api",
+		LoginPath:       "/login",
+		SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+		Endpoints: []Endpoint{
+			{Path: "/pathbody/:context", Method: http.MethodPost, Handler: service.PostPathThenBody, AuthLevel: AuthNone},
+		},
+	}
+	mux := http.NewServeMux()
+	api.RegisterHandlers(mux)
+
+	// Sanity-check the cached body slot is at index 2, not -1.
+	if got := computeBodySlot(service.PostPathThenBody); got != 2 {
+		t.Fatalf("computeBodySlot: expected body slot 2, got %d", got)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/pathbody/web", strings.NewReader(`{"key":"value"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", w.Code, w.Body.String())
+	}
+
+	var actual map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &actual); err != nil {
+		t.Fatalf("failed to parse response: %v (body=%q)", err, w.Body.String())
+	}
+	expected := map[string]string{"context": "web", "key": "value"}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Errorf("body not bound when receiver is beyond In(1): got %#v want %#v", actual, expected)
+	}
+}
+
+// TestPostBodyRejectedWhenNoReceiver verifies that a POST/PUT/PATCH request
+// carrying a body to a handler with no struct/map parameter fails loud with
+// 400 rather than silently dropping the body.
+func TestPostBodyRejectedWhenNoReceiver(t *testing.T) {
+	service := &TestService{}
+	api := &API{
+		BasePath:        "/api",
+		LoginPath:       "/login",
+		SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+		Endpoints: []Endpoint{
+			{Path: "/nobody/:context", Method: http.MethodPost, Handler: service.PostNoBodyReceiver, AuthLevel: AuthNone},
+		},
+	}
+	mux := http.NewServeMux()
+	api.RegisterHandlers(mux)
+
+	if got := computeBodySlot(service.PostNoBodyReceiver); got != -1 {
+		t.Fatalf("computeBodySlot: expected -1 (no body receiver), got %d", got)
+	}
+
+	// Non-empty body -> 400 (fail loud).
+	req := httptest.NewRequest(http.MethodPost, "/api/nobody/web", strings.NewReader(`{"key":"value"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when body present but no receiver, got %d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// TestPostNoReceiverAcceptsEmptyBody verifies that an empty body to a handler
+// with no body receiver still succeeds (action endpoints legitimately take no
+// body).
+func TestPostNoReceiverAcceptsEmptyBody(t *testing.T) {
+	service := &TestService{}
+	api := &API{
+		BasePath:        "/api",
+		LoginPath:       "/login",
+		SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+		Endpoints: []Endpoint{
+			{Path: "/nobody/:context", Method: http.MethodPost, Handler: service.PostNoBodyReceiver, AuthLevel: AuthNone},
+		},
+	}
+	mux := http.NewServeMux()
+	api.RegisterHandlers(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nobody/web", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for empty body with no receiver, got %d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// TestGetWithBodyRejected verifies that a GET request carrying a non-empty body
+// is rejected with 400 (fail loud). GET never decodes a request body, so a body
+// the client sends would otherwise be silently ignored.
+func TestGetWithBodyRejected(t *testing.T) {
+service := &TestService{}
+api := &API{
+BasePath:        "/api",
+LoginPath:       "/login",
+SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+Endpoints: []Endpoint{
+{Path: "/basic", Method: http.MethodGet, Handler: service.GetBasic, AuthLevel: AuthNone},
+},
+}
+mux := http.NewServeMux()
+api.RegisterHandlers(mux)
+
+req := httptest.NewRequest(http.MethodGet, "/api/basic", strings.NewReader(`{"key":"value"}`))
+req.Header.Set("Content-Type", "application/json")
+w := httptest.NewRecorder()
+mux.ServeHTTP(w, req)
+
+if w.Code != http.StatusBadRequest {
+t.Fatalf("expected 400 for GET with body, got %d body=%q", w.Code, w.Body.String())
+}
+}
+
+// TestDeleteWithBodyRejected verifies that a DELETE request carrying a non-empty
+// body is rejected with 400 (fail loud) rather than silently ignored.
+func TestDeleteWithBodyRejected(t *testing.T) {
+service := &TestService{}
+api := &API{
+BasePath:        "/api",
+LoginPath:       "/login",
+SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+Endpoints: []Endpoint{
+{Path: "/items/:itemID", Method: http.MethodDelete, Handler: service.DeleteItem, AuthLevel: AuthNone},
+},
+}
+mux := http.NewServeMux()
+api.RegisterHandlers(mux)
+
+req := httptest.NewRequest(http.MethodDelete, "/api/items/42", strings.NewReader(`{"key":"value"}`))
+req.Header.Set("Content-Type", "application/json")
+w := httptest.NewRecorder()
+mux.ServeHTTP(w, req)
+
+if w.Code != http.StatusBadRequest {
+t.Fatalf("expected 400 for DELETE with body, got %d body=%q", w.Code, w.Body.String())
+}
+}
+
+// TestDeleteEmptyBodyAccepted verifies that a DELETE with no body still
+// succeeds — the hardening only rejects an actually-present body.
+func TestDeleteEmptyBodyAccepted(t *testing.T) {
+service := &TestService{}
+api := &API{
+BasePath:        "/api",
+LoginPath:       "/login",
+SessionProvider: &MockSessionProvider{ShouldAuth: true, UserID: 1, UserState: UserStateComplete},
+Endpoints: []Endpoint{
+{Path: "/items/:itemID", Method: http.MethodDelete, Handler: service.DeleteItem, AuthLevel: AuthNone},
+},
+}
+mux := http.NewServeMux()
+api.RegisterHandlers(mux)
+
+req := httptest.NewRequest(http.MethodDelete, "/api/items/42", nil)
+w := httptest.NewRecorder()
+mux.ServeHTTP(w, req)
+
+if w.Code != http.StatusOK {
+t.Fatalf("expected 200 for DELETE with empty body, got %d body=%q", w.Code, w.Body.String())
+}
 }
